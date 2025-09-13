@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/stacklok/toolhive/pkg/container/runtime"
 	"github.com/stacklok/toolhive/pkg/groups"
@@ -17,6 +18,12 @@ import (
 	"github.com/stacklok/toolhive/pkg/workloads"
 )
 
+const (
+	// imageRetrievalTimeout is the timeout for pulling Docker images
+	// Set to 10 minutes to handle large images (1GB+) on slower connections
+	imageRetrievalTimeout = 10 * time.Minute
+)
+
 // WorkloadService handles business logic for workload operations
 type WorkloadService struct {
 	workloadManager  workloads.Manager
@@ -24,6 +31,7 @@ type WorkloadService struct {
 	secretsProvider  secrets.Provider
 	containerRuntime runtime.Runtime
 	debugMode        bool
+	imageRetriever   retriever.Retriever
 }
 
 // NewWorkloadService creates a new WorkloadService instance
@@ -40,11 +48,62 @@ func NewWorkloadService(
 		secretsProvider:  secretsProvider,
 		containerRuntime: containerRuntime,
 		debugMode:        debugMode,
+		imageRetriever:   retriever.GetMCPServer,
 	}
 }
 
 // CreateWorkloadFromRequest creates a workload from a request
 func (s *WorkloadService) CreateWorkloadFromRequest(ctx context.Context, req *createRequest) (*runner.RunConfig, error) {
+	// Build the full run config
+	runConfig, err := s.BuildFullRunConfig(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Save the workload state
+	if err := runConfig.SaveState(ctx); err != nil {
+		logger.Errorf("Failed to save workload config: %v", err)
+		return nil, fmt.Errorf("failed to save workload config: %w", err)
+	}
+
+	// Start workload
+	if err := s.workloadManager.RunWorkloadDetached(ctx, runConfig); err != nil {
+		logger.Errorf("Failed to start workload: %v", err)
+		return nil, fmt.Errorf("failed to start workload: %w", err)
+	}
+
+	return runConfig, nil
+}
+
+// UpdateWorkloadFromRequest updates a workload from a request
+func (s *WorkloadService) UpdateWorkloadFromRequest(ctx context.Context, name string, req *createRequest) (*runner.RunConfig, error) { //nolint:lll
+	// Build the full run config
+	runConfig, err := s.BuildFullRunConfig(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build workload config: %w", err)
+	}
+
+	// Use the manager's UpdateWorkload method to handle the lifecycle
+	if _, err := s.workloadManager.UpdateWorkload(ctx, name, runConfig); err != nil {
+		return nil, fmt.Errorf("failed to update workload: %w", err)
+	}
+
+	return runConfig, nil
+}
+
+// BuildFullRunConfig builds a complete RunConfig
+//
+//nolint:gocyclo // TODO: refactor this into shorter functions
+func (s *WorkloadService) BuildFullRunConfig(ctx context.Context, req *createRequest) (*runner.RunConfig, error) {
+	// Default proxy mode to SSE if not specified
+	if !types.IsValidProxyMode(req.ProxyMode) {
+		if req.ProxyMode == "" {
+			req.ProxyMode = types.ProxyModeSSE.String()
+		} else {
+			return nil, fmt.Errorf("%w: %s", retriever.ErrInvalidRunConfig, fmt.Sprintf("Invalid proxy_mode: %s", req.ProxyMode))
+		}
+	}
+
 	// Default group if not specified
 	groupName := req.Group
 	if groupName == "" {
@@ -75,14 +134,23 @@ func (s *WorkloadService) CreateWorkloadFromRequest(ctx context.Context, req *cr
 		}
 	} else {
 		var serverMetadata registry.ServerMetadata
+		// Create a dedicated context with longer timeout for image retrieval
+		imageCtx, cancel := context.WithTimeout(ctx, imageRetrievalTimeout)
+		defer cancel()
+
 		// Fetch or build the requested image
-		imageURL, serverMetadata, err = retriever.GetMCPServer(
-			ctx,
+		imageURL, serverMetadata, err = s.imageRetriever(
+			imageCtx,
 			req.Image,
 			"", // We do not let the user specify a CA cert path here.
 			retriever.VerifyImageWarn,
 		)
 		if err != nil {
+			// Check if the error is due to context timeout
+			if imageCtx.Err() == context.DeadlineExceeded {
+				return nil, fmt.Errorf("image retrieval timed out after %v - image may be too large or connection too slow",
+					imageRetrievalTimeout)
+			}
 			return nil, fmt.Errorf("failed to retrieve MCP server image: %w", err)
 		}
 
@@ -113,47 +181,61 @@ func (s *WorkloadService) CreateWorkloadFromRequest(ctx context.Context, req *cr
 	// Build RunConfig
 	runSecrets := secrets.SecretParametersToCLI(req.Secrets)
 
-	runConfig, err := runner.NewRunConfigBuilder().
-		WithRuntime(s.containerRuntime).
-		WithCmdArgs(req.CmdArguments).
-		WithName(req.Name).
-		WithGroup(groupName).
-		WithImage(imageURL).
-		WithRemoteURL(req.URL).
-		WithRemoteAuth(remoteAuthConfig).
-		WithHost(req.Host).
-		WithTargetHost(transport.LocalhostIPv4).
-		WithDebug(s.debugMode).
-		WithVolumes(req.Volumes).
-		WithSecrets(runSecrets).
-		WithAuthzConfigPath(req.AuthzConfig).
-		WithAuditConfigPath("").
-		WithPermissionProfile(req.PermissionProfile).
-		WithNetworkIsolation(req.NetworkIsolation).
-		WithK8sPodPatch("").
-		WithProxyMode(types.ProxyMode(req.ProxyMode)).
-		WithTransportAndPorts(req.Transport, 0, req.TargetPort).
-		WithAuditEnabled(false, "").
-		WithOIDCConfig(req.OIDC.Issuer, req.OIDC.Audience, req.OIDC.JwksURL, req.OIDC.ClientID,
-			"", "", "", "", "", false).
-		WithTelemetryConfig("", false, false, false, "", 0.0, nil, false, nil).
-		WithToolsFilter(req.ToolsFilter).
-		Build(ctx, imageMetadata, req.EnvVars, &runner.DetachedEnvVarValidator{})
+	toolsOverride := make(map[string]runner.ToolOverride)
+	for toolName, toolOverride := range req.ToolsOverride {
+		toolsOverride[toolName] = runner.ToolOverride{
+			Name:        toolOverride.Name,
+			Description: toolOverride.Description,
+		}
+	}
 
+	options := []runner.RunConfigBuilderOption{
+		runner.WithRuntime(s.containerRuntime),
+		runner.WithCmdArgs(req.CmdArguments),
+		runner.WithName(req.Name),
+		runner.WithGroup(groupName),
+		runner.WithImage(imageURL),
+		runner.WithRemoteURL(req.URL),
+		runner.WithRemoteAuth(remoteAuthConfig),
+		runner.WithHost(req.Host),
+		runner.WithTargetHost(transport.LocalhostIPv4),
+		runner.WithDebug(s.debugMode),
+		runner.WithVolumes(req.Volumes),
+		runner.WithSecrets(runSecrets),
+		runner.WithAuthzConfigPath(req.AuthzConfig),
+		runner.WithAuditConfigPath(""),
+		runner.WithPermissionProfile(req.PermissionProfile),
+		runner.WithNetworkIsolation(req.NetworkIsolation),
+		runner.WithK8sPodPatch(""),
+		runner.WithProxyMode(types.ProxyMode(req.ProxyMode)),
+		runner.WithTransportAndPorts(req.Transport, 0, req.TargetPort),
+		runner.WithAuditEnabled(false, ""),
+		runner.WithOIDCConfig(req.OIDC.Issuer, req.OIDC.Audience, req.OIDC.JwksURL, req.OIDC.ClientID,
+			"", "", "", "", "", false),
+		runner.WithToolsFilter(req.ToolsFilter),
+		runner.WithToolsOverride(toolsOverride),
+		runner.WithTelemetryConfig("", false, false, false, "", 0.0, nil, false, nil),
+	}
+
+	// Configure middleware from flags
+	options = append(options,
+		runner.WithMiddlewareFromFlags(
+			nil,
+			req.ToolsFilter,
+			toolsOverride,
+			nil,
+			req.AuthzConfig,
+			false,
+			"",
+			req.Name,
+			req.Transport,
+		),
+	)
+
+	runConfig, err := runner.NewRunConfigBuilder(ctx, imageMetadata, req.EnvVars, &runner.DetachedEnvVarValidator{}, options...)
 	if err != nil {
 		logger.Errorf("Failed to build run config: %v", err)
 		return nil, fmt.Errorf("%w: Failed to build run config: %v", retriever.ErrInvalidRunConfig, err)
-	}
-	// Save the workload state
-	if err := runConfig.SaveState(ctx); err != nil {
-		logger.Errorf("Failed to save workload config: %v", err)
-		return nil, fmt.Errorf("failed to save workload config: %w", err)
-	}
-
-	// Start workload
-	if err := s.workloadManager.RunWorkloadDetached(ctx, runConfig); err != nil {
-		logger.Errorf("Failed to start workload: %v", err)
-		return nil, fmt.Errorf("failed to start workload: %w", err)
 	}
 
 	return runConfig, nil

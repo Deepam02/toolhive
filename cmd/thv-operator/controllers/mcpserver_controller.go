@@ -71,12 +71,20 @@ var defaultRBACRules = []rbacv1.PolicyRule{
 		Resources: []string{"pods/attach"},
 		Verbs:     []string{"create", "get"},
 	},
+	{
+		APIGroups: []string{""},
+		Resources: []string{"configmaps"},
+		Verbs:     []string{"get", "list", "watch"},
+	},
 }
 
 var ctxLogger = log.FromContext(context.Background())
 
 // mcpContainerName is the name of the mcp container used in pod templates
 const mcpContainerName = "mcp"
+
+// trueValue is the string value "true" used for environment variable comparisons
+const trueValue = "true"
 
 // Authorization ConfigMap label constants
 const (
@@ -116,6 +124,23 @@ func (r *MCPServerReconciler) detectPlatform(ctx context.Context) (kubernetes.Pl
 	return r.detectedPlatform, err
 }
 
+// +kubebuilder:rbac:groups=toolhive.stacklok.dev,resources=mcpservers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=toolhive.stacklok.dev,resources=mcpservers/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=toolhive.stacklok.dev,resources=mcpservers/finalizers,verbs=update
+// +kubebuilder:rbac:groups=toolhive.stacklok.dev,resources=mcptoolconfigs,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;delete;get;list;patch;update;watch
+// +kubebuilder:rbac:groups="",resources=services,verbs=create;delete;get;list;patch;update;watch;apply
+// +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=roles,verbs=create;delete;get;list;patch;update;watch
+// +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=rolebindings,verbs=create;delete;get;list;patch;update;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=create;delete;get;list;patch;update;watch
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=create;delete;get;list;patch;update;watch
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete;apply
+// +kubebuilder:rbac:groups="",resources=pods/attach,verbs=create;get
+// +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
+
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 //
@@ -135,6 +160,17 @@ func (r *MCPServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 		// Error reading the object - requeue the request.
 		ctxLogger.Error(err, "Failed to get MCPServer")
+		return ctrl.Result{}, err
+	}
+
+	// Check if MCPToolConfig is referenced and handle it
+	if err := r.handleToolConfig(ctx, mcpServer); err != nil {
+		ctxLogger.Error(err, "Failed to handle MCPToolConfig")
+		// Update status to reflect the error
+		mcpServer.Status.Phase = mcpv1alpha1.MCPServerPhaseFailed
+		if statusErr := r.Status().Update(ctx, mcpServer); statusErr != nil {
+			ctxLogger.Error(statusErr, "Failed to update MCPServer status after MCPToolConfig error")
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -369,6 +405,50 @@ func (r *MCPServerReconciler) updateRBACResourceIfNeeded(
 }
 
 // ensureRBACResources ensures that the RBAC resources are in place for the MCP server
+
+// handleToolConfig handles MCPToolConfig reference for an MCPServer
+func (r *MCPServerReconciler) handleToolConfig(ctx context.Context, m *mcpv1alpha1.MCPServer) error {
+	if m.Spec.ToolConfigRef == nil {
+		// No MCPToolConfig referenced, clear any stored hash
+		if m.Status.ToolConfigHash != "" {
+			m.Status.ToolConfigHash = ""
+			if err := r.Status().Update(ctx, m); err != nil {
+				return fmt.Errorf("failed to clear MCPToolConfig hash from status: %w", err)
+			}
+		}
+		return nil
+	}
+
+	// Get the referenced MCPToolConfig
+	toolConfig, err := GetToolConfigForMCPServer(ctx, r.Client, m)
+	if err != nil {
+		return err
+	}
+
+	if toolConfig == nil {
+		return fmt.Errorf("MCPToolConfig %s not found", m.Spec.ToolConfigRef.Name)
+	}
+
+	// Check if the MCPToolConfig hash has changed
+	if m.Status.ToolConfigHash != toolConfig.Status.ConfigHash {
+		ctxLogger.Info("MCPToolConfig has changed, updating MCPServer",
+			"mcpserver", m.Name,
+			"toolconfig", toolConfig.Name,
+			"oldHash", m.Status.ToolConfigHash,
+			"newHash", toolConfig.Status.ConfigHash)
+
+		// Update the stored hash
+		m.Status.ToolConfigHash = toolConfig.Status.ConfigHash
+		if err := r.Status().Update(ctx, m); err != nil {
+			return fmt.Errorf("failed to update MCPToolConfig hash in status: %w", err)
+		}
+
+		// The change in hash will trigger a reconciliation of the RunConfig
+		// which will pick up the new tool configuration
+	}
+
+	return nil
+}
 func (r *MCPServerReconciler) ensureRBACResources(ctx context.Context, mcpServer *mcpv1alpha1.MCPServer) error {
 	proxyRunnerNameForRBAC := proxyRunnerServiceAccountName(mcpServer.Name)
 
@@ -428,7 +508,6 @@ func (r *MCPServerReconciler) ensureRBACResources(ctx context.Context, mcpServer
 	// otherwise, create a service account for the MCP server
 	mcpServerServiceAccountName := mcpServerServiceAccountName(mcpServer.Name)
 	return r.ensureRBACResource(ctx, mcpServer, "ServiceAccount", func() client.Object {
-		mcpServer.Spec.ServiceAccount = &mcpServerServiceAccountName
 		return &corev1.ServiceAccount{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      mcpServerServiceAccountName,
@@ -447,38 +526,57 @@ func (r *MCPServerReconciler) deploymentForMCPServer(ctx context.Context, m *mcp
 
 	// Prepare container args
 	args := []string{"run", "--foreground=true"}
-	args = append(args, fmt.Sprintf("--proxy-port=%d", m.Spec.Port))
-	args = append(args, fmt.Sprintf("--name=%s", m.Name))
-	args = append(args, fmt.Sprintf("--transport=%s", m.Spec.Transport))
-	args = append(args, fmt.Sprintf("--host=%s", getProxyHost()))
 
-	if m.Spec.TargetPort != 0 {
-		args = append(args, fmt.Sprintf("--target-port=%d", m.Spec.TargetPort))
-	}
-
-	// Generate pod template patch for secrets and merge with user-provided patch
-
-	finalPodTemplateSpec := NewMCPServerPodTemplateSpecBuilder(m.Spec.PodTemplateSpec).
-		WithServiceAccount(m.Spec.ServiceAccount).
-		WithSecrets(m.Spec.Secrets).
-		Build()
-	// Add pod template patch if we have one
-	if finalPodTemplateSpec != nil {
-		podTemplatePatch, err := json.Marshal(finalPodTemplateSpec)
-		if err != nil {
-			logger.Errorf("Failed to marshal pod template spec: %v", err)
-		} else {
-			args = append(args, fmt.Sprintf("--k8s-pod-patch=%s", string(podTemplatePatch)))
+	// Check if global ConfigMap mode is enabled via environment variable
+	useConfigMap := os.Getenv("TOOLHIVE_USE_CONFIGMAP") == trueValue
+	if useConfigMap {
+		// Use the operator-created ConfigMap (format: {name}-runconfig)
+		configMapName := fmt.Sprintf("%s-runconfig", m.Name)
+		configMapRef := fmt.Sprintf("%s/%s", m.Namespace, configMapName)
+		args = append(args, fmt.Sprintf("--from-configmap=%s", configMapRef))
+	} else {
+		// Use individual configuration flags (existing behavior)
+		args = append(args, fmt.Sprintf("--proxy-port=%d", m.Spec.Port))
+		args = append(args, fmt.Sprintf("--name=%s", m.Name))
+		args = append(args, fmt.Sprintf("--transport=%s", m.Spec.Transport))
+		args = append(args, fmt.Sprintf("--host=%s", getProxyHost()))
+		if m.Spec.TargetPort != 0 {
+			args = append(args, fmt.Sprintf("--target-port=%d", m.Spec.TargetPort))
 		}
 	}
 
-	// Add permission profile args
-	if m.Spec.PermissionProfile != nil {
-		switch m.Spec.PermissionProfile.Type {
-		case mcpv1alpha1.PermissionProfileTypeBuiltin:
-			args = append(args, fmt.Sprintf("--permission-profile=%s", m.Spec.PermissionProfile.Name))
-		case mcpv1alpha1.PermissionProfileTypeConfigMap:
-			args = append(args, fmt.Sprintf("--permission-profile-path=/etc/toolhive/profiles/%s", m.Spec.PermissionProfile.Key))
+	// Add pod template patch and permission profile only if not using ConfigMap
+	// When using ConfigMap, these are included in the runconfig.json
+	if !useConfigMap {
+		// Generate pod template patch for secrets and merge with user-provided patch
+		// If service account is not specified, use the default MCP server service account
+		serviceAccount := m.Spec.ServiceAccount
+		if serviceAccount == nil {
+			defaultSA := mcpServerServiceAccountName(m.Name)
+			serviceAccount = &defaultSA
+		}
+		finalPodTemplateSpec := NewMCPServerPodTemplateSpecBuilder(m.Spec.PodTemplateSpec).
+			WithServiceAccount(serviceAccount).
+			WithSecrets(m.Spec.Secrets).
+			Build()
+		// Add pod template patch if we have one
+		if finalPodTemplateSpec != nil {
+			podTemplatePatch, err := json.Marshal(finalPodTemplateSpec)
+			if err != nil {
+				logger.Errorf("Failed to marshal pod template spec: %v", err)
+			} else {
+				args = append(args, fmt.Sprintf("--k8s-pod-patch=%s", string(podTemplatePatch)))
+			}
+		}
+
+		// Add permission profile args
+		if m.Spec.PermissionProfile != nil {
+			switch m.Spec.PermissionProfile.Type {
+			case mcpv1alpha1.PermissionProfileTypeBuiltin:
+				args = append(args, fmt.Sprintf("--permission-profile=%s", m.Spec.PermissionProfile.Name))
+			case mcpv1alpha1.PermissionProfileTypeConfigMap:
+				args = append(args, fmt.Sprintf("--permission-profile-path=/etc/toolhive/profiles/%s", m.Spec.PermissionProfile.Key))
+			}
 		}
 	}
 
@@ -505,15 +603,23 @@ func (r *MCPServerReconciler) deploymentForMCPServer(ctx context.Context, m *mcp
 		args = append(args, authzArgs...)
 	}
 
-	// Add environment variables as --env flags for the MCP server
-	for _, e := range m.Spec.Env {
-		args = append(args, fmt.Sprintf("--env=%s=%s", e.Name, e.Value))
+	// Add audit configuration args
+	if m.Spec.Audit != nil && m.Spec.Audit.Enabled {
+		args = append(args, "--enable-audit")
 	}
 
-	// Add tools filter args
-	if len(m.Spec.ToolsFilter) > 0 {
-		slices.Sort(m.Spec.ToolsFilter)
-		args = append(args, fmt.Sprintf("--tools=%s", strings.Join(m.Spec.ToolsFilter, ",")))
+	// Add environment variables and tools filter only if not using ConfigMap
+	if !useConfigMap {
+		// Add environment variables as --env flags for the MCP server
+		for _, e := range m.Spec.Env {
+			args = append(args, fmt.Sprintf("--env=%s=%s", e.Name, e.Value))
+		}
+
+		// Add tools filter args
+		if len(m.Spec.ToolsFilter) > 0 {
+			slices.Sort(m.Spec.ToolsFilter)
+			args = append(args, fmt.Sprintf("--tools=%s", strings.Join(m.Spec.ToolsFilter, ",")))
+		}
 	}
 
 	// Add OpenTelemetry configuration args
@@ -529,11 +635,13 @@ func (r *MCPServerReconciler) deploymentForMCPServer(ctx context.Context, m *mcp
 		}
 	}
 
-	// Add the image
+	// Always add the image as it's required by proxy runner command signature
+	// When using ConfigMap, the image from ConfigMap takes precedence, but we still need
+	// to provide this as a positional argument to satisfy the command requirements
 	args = append(args, m.Spec.Image)
 
-	// Add additional args
-	if len(m.Spec.Args) > 0 {
+	// Add additional args only if not using ConfigMap
+	if !useConfigMap && len(m.Spec.Args) > 0 {
 		args = append(args, "--")
 		args = append(args, m.Spec.Args...)
 	}
@@ -1080,8 +1188,14 @@ func (r *MCPServerReconciler) deploymentNeedsUpdate(deployment *appsv1.Deploymen
 		}
 
 		// Check if the pod template spec has changed (including secrets)
+		// If service account is not specified, use the default MCP server service account
+		serviceAccount := mcpServer.Spec.ServiceAccount
+		if serviceAccount == nil {
+			defaultSA := mcpServerServiceAccountName(mcpServer.Name)
+			serviceAccount = &defaultSA
+		}
 		expectedPodTemplateSpec := NewMCPServerPodTemplateSpecBuilder(mcpServer.Spec.PodTemplateSpec).
-			WithServiceAccount(mcpServer.Spec.ServiceAccount).
+			WithServiceAccount(serviceAccount).
 			WithSecrets(mcpServer.Spec.Secrets).
 			Build()
 
